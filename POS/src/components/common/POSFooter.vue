@@ -18,7 +18,7 @@ import { call } from '@/utils/apiWrapper'
 // Component state
 const footerText = ref('Powered by')
 const linkText = ref('Match Systems')
-const footerLink = ref('https://match-systems.com')
+const footerLink = ref('https://matchprosys.com')
 const footerRoot = ref(null)
 const config = ref({})
 const serverValidationEnabled = ref(true)
@@ -85,7 +85,7 @@ const loadBrandingConfig = async () => {
 		// Use fallback values
 		footerText.value = 'Powered by'
 		linkText.value = 'Match Systems'
-		footerLink.value = 'https://match-systems.com'
+		footerLink.value = 'https://matchprosys.com'
 	}
 }
 
@@ -131,7 +131,7 @@ const ensureBranding = () => {
 	if (!footerRoot.value) return
 
 	const expectedBrand = atob(config.value._l || btoa('Match Systems'))
-	const expectedUrl = atob(config.value._u || btoa('https://match-systems.com'))
+	const expectedUrl = atob(config.value._u || btoa('https://matchprosys.com'))
 	const expectedText = atob(config.value._t || btoa('Powered by'))
 
 	// Check if values have been tampered
