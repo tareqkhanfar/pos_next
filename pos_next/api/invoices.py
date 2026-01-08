@@ -552,6 +552,46 @@ def submit_invoice(invoice=None, data=None):
         if isinstance(invoice, str):
             invoice = json.loads(invoice)
 
+        # ============================================================================
+        # SERVER-SIDE IDEMPOTENCY CHECK - Prevent Duplicate Invoice Submissions
+        # ============================================================================
+        # Check if this offline invoice has already been synced to prevent duplicates
+        # This is critical for retail/POS systems to ensure 100% duplicate prevention
+        # ============================================================================
+        offline_id = invoice.get("offline_id") or data.get("offline_id")
+
+        if offline_id:
+            # Import here to avoid circular dependencies
+            from pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync import OfflineInvoiceSync
+
+            # Check if this offline_id has already been synced
+            sync_check = OfflineInvoiceSync.is_synced(offline_id)
+
+            if sync_check.get("synced"):
+                # This invoice was already submitted - return the existing invoice
+                existing_invoice_name = sync_check.get("sales_invoice")
+                frappe.logger().info(
+                    f"Duplicate offline invoice detected: {offline_id} "
+                    f"already synced as {existing_invoice_name}"
+                )
+
+                # Get the existing invoice details
+                existing_doc = frappe.get_doc("Sales Invoice", existing_invoice_name)
+
+                return {
+                    "name": existing_doc.name,
+                    "status": existing_doc.docstatus,
+                    "grand_total": existing_doc.grand_total,
+                    "total": existing_doc.total,
+                    "net_total": existing_doc.net_total,
+                    "outstanding_amount": existing_doc.outstanding_amount,
+                    "paid_amount": existing_doc.paid_amount,
+                    "change_amount": getattr(existing_doc, "change_amount", 0),
+                    "is_duplicate": True,  # Flag to indicate this was a duplicate
+                    "original_offline_id": offline_id
+                }
+        # ============================================================================
+
         pos_profile = invoice.get("pos_profile")
         doctype = "Sales Invoice"
 
@@ -690,6 +730,37 @@ def submit_invoice(invoice=None, data=None):
                     alert=True,
                     indicator="orange"
                 )
+
+        # ============================================================================
+        # CREATE OFFLINE SYNC RECORD - Track this submission to prevent future duplicates
+        # ============================================================================
+        if offline_id:
+            try:
+                from pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync import OfflineInvoiceSync
+
+                # Create sync record with invoice metadata
+                OfflineInvoiceSync.create_sync_record(
+                    offline_id=offline_id,
+                    sales_invoice=invoice_doc.name,
+                    invoice_data={
+                        "customer": invoice_doc.customer,
+                        "grand_total": invoice_doc.grand_total,
+                        "posting_date": invoice_doc.posting_date,
+                        "posting_time": invoice_doc.posting_time
+                    }
+                )
+
+                frappe.logger().info(
+                    f"Created offline sync record: {offline_id} -> {invoice_doc.name}"
+                )
+            except Exception as sync_error:
+                # Log the error but don't fail the invoice submission
+                frappe.log_error(
+                    title="Offline Sync Record Creation Error",
+                    message=f"offline_id: {offline_id}, Invoice: {invoice_doc.name}, "
+                            f"Error: {str(sync_error)}\n{frappe.get_traceback()}"
+                )
+        # ============================================================================
 
         # Return complete invoice details
         return {

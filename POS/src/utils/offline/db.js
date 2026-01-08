@@ -38,11 +38,8 @@ const CURRENT_SCHEMA = {
 	// Key-value store for settings and metadata
 	settings: "&key",
 
-	// Invoice queue for offline submissions
-	invoice_queue: "++id, timestamp, synced, invoice_hash",
-
-	// Invoice hash registry for persistent deduplication
-	invoice_hashes: "&hash, timestamp, invoice_id",
+	// Invoice queue for offline submissions (UUID-based deduplication)
+	invoice_queue: "++id, timestamp, synced, offline_id",
 
 	// Items cache with searchable fields
 	items: "&item_code, item_name, item_group, *barcodes",

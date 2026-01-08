@@ -5,66 +5,38 @@ import { offlineState } from "./offlineState"
 // Mutex to prevent concurrent sync operations
 let syncInProgress = false
 
-// Generate hash for invoice deduplication
-const generateInvoiceHash = (invoiceData) => {
-	if (!invoiceData || typeof invoiceData !== 'object') {
-		return null
+// ============================================================================
+// UUID-BASED OFFLINE ID GENERATION (Brainwise Approach)
+// ============================================================================
+// Generates a unique offline identifier for each invoice
+// Format: pos_offline_<uuid>
+// This ensures 100% uniqueness and allows server-side tracking
+// ============================================================================
+
+/**
+ * Generate a UUID v4
+ * @returns {string} UUID string
+ */
+const generateUUID = () => {
+	// Use crypto.randomUUID if available (modern browsers)
+	if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+		return crypto.randomUUID()
 	}
 
-	try {
-		// Create a deterministic string from key invoice properties
-		const hashString = JSON.stringify({
-			customer: invoiceData.customer || '',
-			posting_date: invoiceData.posting_date || '',
-			posting_time: invoiceData.posting_time || '',
-			grand_total: invoiceData.grand_total || 0,
-			items_count: Array.isArray(invoiceData.items) ? invoiceData.items.length : 0,
-			// Include first item details for better uniqueness
-			first_item: Array.isArray(invoiceData.items) && invoiceData.items.length > 0
-				? {
-					item_code: invoiceData.items[0].item_code,
-					qty: invoiceData.items[0].quantity || invoiceData.items[0].qty
-				}
-				: null
-		})
-
-		// Simple hash function (FNV-1a)
-		let hash = 2166136261
-		for (let i = 0; i < hashString.length; i++) {
-			hash ^= hashString.charCodeAt(i)
-			hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)
-		}
-		return (hash >>> 0).toString(36)
-	} catch (error) {
-		console.error('Error generating invoice hash:', error)
-		return null
-	}
+	// Fallback to manual UUID v4 generation
+	return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+		const r = (Math.random() * 16) | 0
+		const v = c === 'x' ? r : (r & 0x3) | 0x8
+		return v.toString(16)
+	})
 }
 
-// Check if invoice hash already exists in persistent storage
-const isInvoiceHashExists = async (hash) => {
-	try {
-		const existingHash = await db.invoice_hashes.get(hash)
-		return !!existingHash
-	} catch (error) {
-		console.error('Error checking invoice hash:', error)
-		return false
-	}
-}
-
-// Store invoice hash permanently in IndexedDB
-const storeInvoiceHash = async (hash, invoiceId) => {
-	try {
-		await db.invoice_hashes.put({
-			hash: hash,
-			timestamp: Date.now(),
-			invoice_id: invoiceId
-		})
-		return true
-	} catch (error) {
-		console.error('Error storing invoice hash:', error)
-		return false
-	}
+/**
+ * Generate offline ID for invoice
+ * @returns {string} Unique offline identifier
+ */
+export const generateOfflineId = () => {
+	return `pos_offline_${generateUUID()}`
 }
 
 // Ping server to check connectivity
@@ -113,33 +85,29 @@ export const saveOfflineInvoice = async (invoiceData) => {
 		// Clean data (remove reactive properties)
 		const cleanData = JSON.parse(JSON.stringify(invoiceData))
 
-		// Generate hash for deduplication
-		const invoiceHash = generateInvoiceHash(cleanData)
-
-		// Check if this exact invoice was already saved offline
-		if (invoiceHash && await isInvoiceHashExists(invoiceHash)) {
-			console.warn(`Duplicate invoice detected while saving offline (hash: ${invoiceHash})`)
-			throw new Error("This invoice was already saved offline. Please check your pending invoices.")
+		// ============================================================================
+		// GENERATE UNIQUE OFFLINE ID (UUID-based approach)
+		// ============================================================================
+		// Generate a unique offline_id for this invoice if not already present
+		// This ID will be sent to the server for idempotency checking
+		// ============================================================================
+		if (!cleanData.offline_id) {
+			cleanData.offline_id = generateOfflineId()
 		}
 
-		// Add to queue with hash
+		// Add to queue with offline_id
 		const invoiceId = await db.invoice_queue.add({
 			data: cleanData,
 			timestamp: Date.now(),
 			synced: false,
 			retry_count: 0,
-			invoice_hash: invoiceHash
+			offline_id: cleanData.offline_id  // Store offline_id for tracking
 		})
-
-		// Store hash permanently to prevent future duplicates
-		if (invoiceHash) {
-			await storeInvoiceHash(invoiceHash, invoiceId)
-		}
 
 		// Update local stock
 		await updateLocalStock(cleanData.items)
 
-		console.log(`Invoice saved to offline queue with hash: ${invoiceHash}`)
+		console.log(`Invoice saved to offline queue with offline_id: ${cleanData.offline_id}`)
 		return true
 	} catch (error) {
 		console.error("Error saving offline invoice:", error)
@@ -211,29 +179,50 @@ export const syncOfflineInvoices = async () => {
 			}
 
 			try {
-				// Generate hash for deduplication (or use stored hash)
-				const invoiceHash = invoice.invoice_hash || generateInvoiceHash(invoice.data)
+				// ============================================================================
+				// CLIENT-SIDE PRE-CHECK: Verify if invoice was already synced
+				// ============================================================================
+				// Before attempting to submit, check if this offline_id was already synced
+				// This reduces unnecessary server calls and network traffic
+				// ============================================================================
+				const offlineId = invoice.offline_id || invoice.data?.offline_id
 
-				// Check if this invoice was already synced (persistent check in IndexedDB)
-				if (invoiceHash && await isInvoiceHashExists(invoiceHash)) {
-					// Check if this hash belongs to a different invoice ID (already synced)
-					const existingHashRecord = await db.invoice_hashes.get(invoiceHash)
-
-					if (existingHashRecord && existingHashRecord.invoice_id !== invoice.id) {
-						console.log(`Duplicate invoice detected (hash: ${invoiceHash}, original ID: ${existingHashRecord.invoice_id}), skipping...`)
-						// Mark as synced to prevent future attempts
-						await db.invoice_queue.update(invoice.id, {
-							synced: true,
-							duplicate: true
+				if (offlineId) {
+					try {
+						// Check server if this offline_id was already synced
+						const syncCheck = await call("pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync.check_offline_invoice_synced", {
+							offline_id: offlineId
 						})
-						duplicateCount++
-						continue
+
+						if (syncCheck && syncCheck.synced) {
+							console.log(`Invoice already synced: ${offlineId} -> ${syncCheck.sales_invoice}`)
+
+							// Mark as synced locally
+							await db.invoice_queue.update(invoice.id, {
+								synced: true,
+								duplicate: true,
+								synced_invoice_name: syncCheck.sales_invoice
+							})
+
+							duplicateCount++
+							continue
+						}
+					} catch (checkError) {
+						// If pre-check fails, continue with submission
+						// The server-side idempotency check will catch duplicates
+						console.warn(`Pre-check failed for ${offlineId}, continuing with submission:`, checkError)
 					}
 				}
+				// ============================================================================
 
 				// Transform items: map 'quantity' to 'qty' for ERPNext compatibility
 				// Offline storage uses 'quantity' (cart format) but server expects 'qty'
 				const invoiceData = { ...invoice.data }
+
+				// Ensure offline_id is present in invoice data
+				if (offlineId && !invoiceData.offline_id) {
+					invoiceData.offline_id = offlineId
+				}
 
 				// Defensive type check for items array
 				if (invoiceData.items && Array.isArray(invoiceData.items)) {
@@ -252,8 +241,9 @@ export const syncOfflineInvoices = async () => {
 					throw new Error('Invalid items array')
 				}
 
-				// Submit invoice to server
-				// The API expects 'data' parameter with nested 'invoice' and 'data' keys
+				// ============================================================================
+				// SUBMIT INVOICE TO SERVER (with server-side idempotency protection)
+				// ============================================================================
 				const response = await call("pos_next.api.invoices.submit_invoice", {
 					data: JSON.stringify({
 						invoice: invoiceData,
@@ -262,19 +252,25 @@ export const syncOfflineInvoices = async () => {
 				})
 
 				if (response.message || response.name) {
-					// Store hash permanently to prevent future duplicates
-					if (invoiceHash) {
-						await storeInvoiceHash(invoiceHash, invoice.id)
+					// Check if this was detected as a duplicate by the server
+					const isDuplicate = response.is_duplicate === true
+
+					if (isDuplicate) {
+						console.log(`Server detected duplicate: ${offlineId} -> ${response.name}`)
+						duplicateCount++
+					} else {
+						successCount++
 					}
 
 					// Mark as synced
 					await db.invoice_queue.update(invoice.id, {
 						synced: true,
-						synced_invoice_name: response.name || response.message
+						synced_invoice_name: response.name || response.message,
+						duplicate: isDuplicate
 					})
-					successCount++
+
 					console.log(
-						`Invoice ${invoice.id} synced successfully as ${response.name || response.message}`,
+						`Invoice ${invoice.id} ${isDuplicate ? 'was duplicate of' : 'synced successfully as'} ${response.name || response.message}`,
 					)
 				}
 			} catch (error) {
@@ -312,12 +308,6 @@ export const syncOfflineInvoices = async () => {
 		const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
 		await db.invoice_queue
 			.filter((item) => item.synced === true && item.timestamp < weekAgo)
-			.delete()
-
-		// Clean up invoice hashes older than 30 days (keep longer for better protection)
-		const monthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000
-		await db.invoice_hashes
-			.filter((item) => item.timestamp < monthAgo)
 			.delete()
 
 		return {
