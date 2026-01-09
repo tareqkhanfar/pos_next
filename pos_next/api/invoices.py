@@ -202,7 +202,7 @@ def _auto_set_return_batches(invoice_doc):
     available batch in FIFO order. If no batches exist in the selected
     warehouse, an informative error is raised.
     """
-    if not invoice_doc.is_return or invoice_doc.get("return_against"):
+    if not invoice_doc.get("is_return") or invoice_doc.get("return_against"):
         return
 
     for d in invoice_doc.items:
@@ -310,7 +310,7 @@ def update_invoice(data):
         data = json.loads(data) if isinstance(data, str) else data
 
         pos_profile = data.get("pos_profile")
-        doctype = "Sales Invoice"
+        doctype = data.get("doctype", "Sales Invoice")
 
         # Ensure the document type is set
         data.setdefault("doctype", doctype)
@@ -326,40 +326,43 @@ def update_invoice(data):
         if pos_profile:
             try:
                 pos_profile_doc = frappe.get_cached_doc("POS Profile", pos_profile)
-            except Exception as profile_err:
+            except Exception:
                 frappe.throw(_("Unable to load POS Profile {0}").format(pos_profile))
 
             invoice_doc.pos_profile = pos_profile
 
-            if pos_profile_doc.company and not invoice_doc.get("company"):
-                invoice_doc.company = pos_profile_doc.company
-            if pos_profile_doc.currency and not invoice_doc.get("currency"):
-                invoice_doc.currency = pos_profile_doc.currency
+            if pos_profile_doc:
+                if pos_profile_doc.company and not invoice_doc.get("company"):
+                    invoice_doc.company = pos_profile_doc.company
+                if pos_profile_doc.currency and not invoice_doc.get("currency"):
+                    invoice_doc.currency = pos_profile_doc.currency
 
-            # Copy accounting dimensions from POS Profile
-            if hasattr(pos_profile_doc, "branch") and pos_profile_doc.branch:
-                invoice_doc.branch = pos_profile_doc.branch
-                # Also set branch on all items for GL entries
-                for item in invoice_doc.get("items", []):
-                    item.branch = pos_profile_doc.branch
+                # Copy accounting dimensions from POS Profile
+                if hasattr(pos_profile_doc, "branch") and pos_profile_doc.branch:
+                    invoice_doc.branch = pos_profile_doc.branch
+                    # Also set branch on all items for GL entries
+                    for item in invoice_doc.get("items", []):
+                        item.branch = pos_profile_doc.branch
 
         company = invoice_doc.get("company") or (
             pos_profile_doc.company if pos_profile_doc else None
         )
 
-        if company and invoice_doc.get("payments"):
+        if company and invoice_doc.get("payments") and doctype == "Sales Invoice":
             for payment in invoice_doc.payments:
-                if payment.mode_of_payment and not payment.get("account"):
+                mode_of_payment = payment.get("mode_of_payment")
+                if mode_of_payment and not payment.get("account"):
                     try:
                         account_info = get_payment_account(
-                            payment.mode_of_payment, company
+                            mode_of_payment, company
                         )
-                        payment.account = account_info.get("account")
+                        if account_info:
+                            payment["account"] = account_info.get("account")
                     except Exception:
                         pass  # Will be handled during save
 
         # Validate return items if this is a return invoice
-        if (data.get("is_return") or invoice_doc.is_return) and invoice_doc.get(
+        if (data.get("is_return") or invoice_doc.get("is_return")) and invoice_doc.get(
             "return_against"
         ):
             validation = validate_return_items(
@@ -428,8 +431,9 @@ def update_invoice(data):
             # prevents rounding issues and ensures UI matches invoice
 
         # Set invoice flags BEFORE calculations
-        invoice_doc.is_pos = 1
-        invoice_doc.update_stock = 1
+        if doctype == "Sales Invoice":
+            invoice_doc.is_pos = 1
+            invoice_doc.update_stock = 1
 
         # ========================================================================
         # ROUNDING CONFIGURATION
@@ -460,29 +464,37 @@ def update_invoice(data):
 
         # Calculate totals and apply discounts (with rounding disabled)
         invoice_doc.calculate_taxes_and_totals()
+        if invoice_doc.grand_total is None:
+            invoice_doc.grand_total = 0.0
+        if invoice_doc.base_grand_total is None:
+            invoice_doc.base_grand_total = 0.0
 
         # Set accounts for payment methods before saving
         for payment in invoice_doc.payments:
-            if payment.mode_of_payment and not payment.get("account"):
+            mode_of_payment = payment.get("mode_of_payment")
+            if mode_of_payment and not payment.get("account"):
                 try:
                     account_info = get_payment_account(
-                        payment.mode_of_payment, invoice_doc.company
+                        mode_of_payment, invoice_doc.company
                     )
-                    payment.account = account_info["account"]
+                    if account_info:
+                        payment.account = account_info.get("account")
                 except Exception:
                     pass  # Will be handled during save
 
         # For return invoices, ensure payments are negative
-        if invoice_doc.is_return:
-            for payment in invoice_doc.payments:
-                payment.amount = -abs(payment.amount)
-                if payment.base_amount:
-                    payment.base_amount = -abs(payment.base_amount)
+        if invoice_doc.get("is_return"):
+            # Return handling is primarily for Sales Invoice
+            if doctype == "Sales Invoice" and invoice_doc.get("payments"):
+                for payment in invoice_doc.payments:
+                    payment.amount = -abs(payment.amount)
+                    if payment.base_amount:
+                        payment.base_amount = -abs(payment.base_amount)
 
-            invoice_doc.paid_amount = flt(sum(p.amount for p in invoice_doc.payments))
-            invoice_doc.base_paid_amount = flt(
-                sum(p.base_amount or 0 for p in invoice_doc.payments)
-            )
+                invoice_doc.paid_amount = flt(sum(p.amount for p in invoice_doc.payments))
+                invoice_doc.base_paid_amount = flt(
+                    sum(p.base_amount or 0 for p in invoice_doc.payments)
+                )
 
         # Validate and track POS Coupon if coupon_code is provided
         coupon_code = data.get("coupon_code")
@@ -497,8 +509,9 @@ def update_invoice(data):
                     company=invoice_doc.company
                 )
 
-                if not coupon_result.get("valid"):
-                    frappe.throw(_(coupon_result.get("msg", "Invalid coupon code")))
+                if not coupon_result or not coupon_result.get("valid"):
+                    error_msg = coupon_result.get("msg", "Invalid coupon code") if coupon_result else "Invalid coupon code"
+                    frappe.throw(_(error_msg))
 
                 # Store coupon code on invoice for tracking
                 invoice_doc.coupon_code = coupon_code
@@ -515,99 +528,315 @@ def update_invoice(data):
         raise
 
 
+PENDING_TIMEOUT_MINUTES = 5  # Pending records older than this are considered stale
+
+
+def _is_pending_expired(modified_time):
+    """Check if a pending record has expired based on modified time."""
+    if not modified_time:
+        return True  # No timestamp means treat as expired
+    age_minutes = (frappe.utils.now_datetime() - modified_time).total_seconds() / 60
+    return age_minutes > PENDING_TIMEOUT_MINUTES
+
+
+def _reuse_sync_record(sync_record_name):
+    """Reset an existing sync record to Pending status for retry."""
+    sync_doc = frappe.get_doc("Offline Invoice Sync", sync_record_name)
+    sync_doc.status = "Pending"
+    sync_doc.synced_at = None
+    sync_doc.flags.ignore_permissions = True
+    sync_doc.save()
+    return {"already_synced": False, "sync_record_name": sync_record_name}
+
+
+def _handle_offline_deduplication(offline_id, pos_profile=None, customer=None):
+    """
+    Handle offline invoice deduplication with race condition protection.
+
+    Uses a reservation pattern:
+    1. Check if a sync record exists (with row-level lock)
+    2. If synced with valid invoice, return existing invoice
+    3. If synced but invoice deleted/invalid, allow retry
+    4. If pending but expired (>5 min), allow retry
+    5. If pending and active, reject (another request processing)
+    6. If failed, allow retry
+    7. If not exists, create pending reservation
+
+    Args:
+        offline_id: The unique offline ID from the client
+        pos_profile: POS Profile name
+        customer: Customer name
+
+    Returns:
+        dict with:
+        - already_synced (bool): True if invoice was already synced
+        - invoice_data (dict): Existing invoice data if already_synced
+        - sync_record_name (str): Name of the sync record for this attempt
+    """
+    # Acquire row-level lock to prevent race conditions
+    existing_sync = frappe.db.get_value(
+        "Offline Invoice Sync",
+        {"offline_id": offline_id},
+        ["name", "sales_invoice", "status", "modified"],
+        as_dict=True,
+        for_update=True
+    )
+
+    if existing_sync:
+        sync_status = existing_sync.get("status")
+        sync_record_name = existing_sync.name
+
+        # Handle Pending status
+        if sync_status == "Pending":
+            if _is_pending_expired(existing_sync.get("modified")):
+                # Expired pending - allow retry
+                return _reuse_sync_record(sync_record_name)
+            else:
+                # Active pending - reject with specific error code
+                frappe.throw(
+                    _("This invoice is currently being processed. Please wait."),
+                    exc=frappe.ValidationError,
+                    title="SYNC_IN_PROGRESS"
+                )
+
+        # Handle Failed status - allow retry
+        if sync_status == "Failed":
+            return _reuse_sync_record(sync_record_name)
+
+        # Handle Synced status - verify invoice still valid
+        if sync_status == "Synced" and existing_sync.sales_invoice:
+            if frappe.db.exists("Sales Invoice", existing_sync.sales_invoice):
+                existing_invoice = frappe.get_doc("Sales Invoice", existing_sync.sales_invoice)
+                if existing_invoice.docstatus == 1:
+                    return {
+                        "already_synced": True,
+                        "invoice_data": {
+                            "name": existing_invoice.name,
+                            "status": existing_invoice.docstatus,
+                            "grand_total": existing_invoice.grand_total,
+                            "total": existing_invoice.total,
+                            "net_total": existing_invoice.net_total,
+                            "outstanding_amount": getattr(existing_invoice, "outstanding_amount", 0),
+                            "paid_amount": getattr(existing_invoice, "paid_amount", 0),
+                            "change_amount": getattr(existing_invoice, "change_amount", 0),
+                            "duplicate_prevented": True,
+                            "offline_id": offline_id,
+                        }
+                    }
+
+            # Synced record points to deleted/invalid invoice - allow retry
+            return _reuse_sync_record(sync_record_name)
+
+        # Unknown status or synced without invoice - allow retry
+        return _reuse_sync_record(sync_record_name)
+
+    # No existing record - create pending reservation
+    try:
+        pending_sync = frappe.get_doc({
+            "doctype": "Offline Invoice Sync",
+            "offline_id": offline_id,
+            "sales_invoice": "",
+            "pos_profile": pos_profile,
+            "customer": customer,
+            "status": "Pending",
+        })
+        pending_sync.flags.ignore_permissions = True
+        pending_sync.insert()
+
+        return {
+            "already_synced": False,
+            "sync_record_name": pending_sync.name
+        }
+    except frappe.DuplicateEntryError:
+        # Race condition: another request just created the record
+        # Retry the check to get the new record
+        return _handle_offline_deduplication(offline_id, pos_profile, customer)
+
+
+def _complete_offline_sync(sync_record_name, invoice_name):
+    """
+    Mark an offline sync record as completed after successful invoice submission.
+
+    Args:
+        sync_record_name: Name of the Offline Invoice Sync record
+        invoice_name: Name of the submitted Sales Invoice
+    """
+    if not sync_record_name:
+        return
+
+    try:
+        sync_doc = frappe.get_doc("Offline Invoice Sync", sync_record_name)
+        sync_doc.sales_invoice = invoice_name
+        sync_doc.status = "Synced"
+        sync_doc.synced_at = frappe.utils.now_datetime()
+        sync_doc.flags.ignore_permissions = True
+        sync_doc.save()
+    except Exception as error:
+        frappe.log_error(
+            title="Offline Sync Completion Error",
+            message=f"Failed to complete sync record {sync_record_name} for invoice {invoice_name}: {str(error)}"
+        )
+
+
+def _cleanup_failed_sync(sync_record_name):
+    """
+    Mark a sync record as failed when invoice submission fails.
+
+    Instead of deleting, we mark as 'failed' to:
+    1. Preserve audit trail of sync attempts
+    2. Allow manual investigation of failures
+    3. Enable retry logic based on failure count
+
+    Args:
+        sync_record_name: Name of the Offline Invoice Sync record
+    """
+    if not sync_record_name:
+        return
+
+    try:
+        sync_doc = frappe.get_doc("Offline Invoice Sync", sync_record_name)
+        sync_doc.status = "Failed"
+        sync_doc.synced_at = frappe.utils.now_datetime()
+        sync_doc.flags.ignore_permissions = True
+        sync_doc.save()
+    except Exception as error:
+        frappe.log_error(
+            title="Offline Sync Cleanup Error",
+            message=f"Failed to mark sync record {sync_record_name} as failed: {str(error)}"
+        )
+
+
+@frappe.whitelist()
+def check_offline_invoice_synced(offline_id):
+    """
+    Check if an offline invoice has already been synced.
+
+    This endpoint is called by the frontend before attempting to sync
+    an offline invoice, preventing duplicate submissions.
+
+    Args:
+        offline_id: The unique offline ID to check
+
+    Returns:
+        dict with 'synced' (bool) and 'sales_invoice' (str or None)
+    """
+    from pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync import (
+        OfflineInvoiceSync,
+    )
+
+    result = OfflineInvoiceSync.is_synced(offline_id)
+
+    # Defensive check - ensure result is a dict
+    if not result or not isinstance(result, dict):
+        return {"synced": False, "sales_invoice": None}
+
+    # Additionally verify the sales invoice still exists and is submitted
+    if result.get("synced") and result.get("sales_invoice"):
+        if frappe.db.exists("Sales Invoice", result["sales_invoice"]):
+            docstatus = frappe.db.get_value(
+                "Sales Invoice", result["sales_invoice"], "docstatus"
+            )
+            if docstatus == 1:  # Submitted
+                return result
+
+        # Invoice was deleted or not submitted, clear the sync record
+        return {"synced": False, "sales_invoice": None}
+
+    return result
+
+
 @frappe.whitelist()
 def submit_invoice(invoice=None, data=None):
     """Submit the invoice (Step 2)."""
-    try:
+    # Handle different calling conventions
+    if invoice is None:
+        if data:
+            # Check if data is a JSON string containing both params
+            data_parsed = json.loads(data) if isinstance(data, str) else data
 
-        # Handle different calling conventions
-        if invoice is None:
-            if data:
-                # Check if data is a JSON string containing both params
-                data_parsed = json.loads(data) if isinstance(data, str) else data
-
-                # frappe-ui might send all params nested in data
-                if isinstance(data_parsed, dict):
-                    if "invoice" in data_parsed:
-                        invoice = data_parsed.get("invoice")
-                        data = data_parsed.get("data", {})
-                    elif "name" in data_parsed or "doctype" in data_parsed:
-                        # Data itself might be the invoice
-                        invoice = data_parsed
-                        data = {}
-                    else:
-                        frappe.throw(
-                            _("Missing invoice parameter. Received data: {0}").format(
-                                json.dumps(data_parsed, default=str)
-                            )
-                        )
+            # frappe-ui might send all params nested in data
+            if isinstance(data_parsed, dict):
+                if "invoice" in data_parsed:
+                    invoice = data_parsed.get("invoice")
+                    data = data_parsed.get("data", {})
+                elif "name" in data_parsed or "doctype" in data_parsed:
+                    # Data itself might be the invoice
+                    invoice = data_parsed
+                    data = {}
                 else:
-                    frappe.throw(_("Missing invoice parameter"))
+                    frappe.throw(
+                        _("Missing invoice parameter. Received data: {0}").format(
+                            json.dumps(data_parsed, default=str)
+                        )
+                    )
             else:
-                frappe.throw(_("Both invoice and data parameters are missing"))
+                frappe.throw(_("Missing invoice parameter"))
+        else:
+            frappe.throw(_("Both invoice and data parameters are missing"))
 
-        # Parse JSON strings if needed
-        if isinstance(data, str):
-            data = json.loads(data) if data and data != "{}" else {}
-        if isinstance(invoice, str):
-            invoice = json.loads(invoice)
+    # Parse JSON strings if needed
+    if isinstance(data, str):
+        data = json.loads(data) if data and data != "{}" else {}
+    if isinstance(invoice, str):
+        invoice = json.loads(invoice)
 
-        # ============================================================================
-        # SERVER-SIDE IDEMPOTENCY CHECK - Prevent Duplicate Invoice Submissions
-        # ============================================================================
-        # Check if this offline invoice has already been synced to prevent duplicates
-        # This is critical for retail/POS systems to ensure 100% duplicate prevention
-        # ============================================================================
-        offline_id = invoice.get("offline_id") or data.get("offline_id")
+    # Ensure invoice and data are dicts
+    if not isinstance(invoice, dict):
+        frappe.throw(_("Invalid invoice format"))
+        return  # Never reached, but helps type checker
+    if not isinstance(data, dict):
+        data = {}
 
-        if offline_id:
-            # Import here to avoid circular dependencies
-            from pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync import OfflineInvoiceSync
+    pos_profile = invoice.get("pos_profile")
+    doctype = invoice.get("doctype", "Sales Invoice")
 
-            # Check if this offline_id has already been synced
-            sync_check = OfflineInvoiceSync.is_synced(offline_id)
+    # ========================================================================
+    # OFFLINE INVOICE DEDUPLICATION
+    # ========================================================================
+    # Prevents duplicate invoice creation when the same offline invoice is
+    # submitted multiple times (e.g., network retry, multiple tabs).
+    # Uses a reservation pattern: create a "pending" record first, then
+    # update to "synced" after successful submission.
+    # ========================================================================
+    offline_id = invoice.get("offline_id") or data.get("offline_id")
+    sync_record_name = None
 
-            if sync_check.get("synced"):
-                # This invoice was already submitted - return the existing invoice
-                existing_invoice_name = sync_check.get("sales_invoice")
-                frappe.logger().info(
-                    f"Duplicate offline invoice detected: {offline_id} "
-                    f"already synced as {existing_invoice_name}"
-                )
+    if offline_id:
+        dedup_result = _handle_offline_deduplication(
+            offline_id=offline_id,
+            pos_profile=pos_profile,
+            customer=invoice.get("customer")
+        )
 
-                # Get the existing invoice details
-                existing_doc = frappe.get_doc("Sales Invoice", existing_invoice_name)
+        if dedup_result and dedup_result.get("already_synced"):
+            # Invoice was already synced - return the existing invoice details
+            return dedup_result.get("invoice_data", {})
 
-                return {
-                    "name": existing_doc.name,
-                    "status": existing_doc.docstatus,
-                    "grand_total": existing_doc.grand_total,
-                    "total": existing_doc.total,
-                    "net_total": existing_doc.net_total,
-                    "outstanding_amount": existing_doc.outstanding_amount,
-                    "paid_amount": existing_doc.paid_amount,
-                    "change_amount": getattr(existing_doc, "change_amount", 0),
-                    "is_duplicate": True,  # Flag to indicate this was a duplicate
-                    "original_offline_id": offline_id
-                }
-        # ============================================================================
+        # Store the sync record name for later update
+        sync_record_name = dedup_result.get("sync_record_name") if dedup_result else None
 
-        pos_profile = invoice.get("pos_profile")
-        doctype = "Sales Invoice"
+    # Track whether invoice was successfully submitted
+    invoice_submitted = False
 
+    try:
         invoice_name = invoice.get("name")
 
         # Get or create invoice
         if not invoice_name or not frappe.db.exists(doctype, invoice_name):
             created = update_invoice(json.dumps(invoice))
+            if not created or not isinstance(created, dict):
+                frappe.throw(_("Failed to create invoice draft"))
             invoice_name = created.get("name")
+            if not invoice_name:
+                frappe.throw(_("Failed to get invoice name from draft"))
             invoice_doc = frappe.get_doc(doctype, invoice_name)
         else:
             invoice_doc = frappe.get_doc(doctype, invoice_name)
             invoice_doc.update(invoice)
 
-        # Ensure update_stock is set
-        invoice_doc.update_stock = 1
+        # Ensure update_stock is set for Sales Invoice
+        if doctype == "Sales Invoice":
+            invoice_doc.update_stock = 1
 
         # Copy accounting dimensions from POS Profile if not already set
         if pos_profile and not invoice_doc.get("branch"):
@@ -623,25 +852,28 @@ def submit_invoice(invoice=None, data=None):
                 pass  # Branch is optional, continue without it
 
         # Set accounts for all payment methods before saving
-        for payment in invoice_doc.payments:
-            if payment.mode_of_payment:
-                account_info = get_payment_account(
-                    payment.mode_of_payment, invoice_doc.company
-                )
-                payment.account = account_info["account"]
+        if doctype == "Sales Invoice" and hasattr(invoice_doc, "payments"):
+            for payment in invoice_doc.payments:
+                if payment.mode_of_payment:
+                    account_info = get_payment_account(
+                        payment.mode_of_payment, invoice_doc.company
+                    )
+                    if account_info:
+                        payment.account = account_info.get("account")
 
         # Handle sales team (multiple sales persons)
         sales_team_data = invoice.get("sales_team") or data.get("sales_team")
-        if sales_team_data:
+        if sales_team_data and isinstance(sales_team_data, list):
             # Clear existing sales team entries
             invoice_doc.sales_team = []
 
             # Add new sales team entries
             for member in sales_team_data:
-                invoice_doc.append("sales_team", {
-                    "sales_person": member.get("sales_person"),
-                    "allocated_percentage": member.get("allocated_percentage", 0),
-                })
+                if member and isinstance(member, dict):
+                    invoice_doc.append("sales_team", {
+                        "sales_person": member.get("sales_person"),
+                        "allocated_percentage": member.get("allocated_percentage", 0),
+                    })
 
         # Handle POS Coupon if coupon_code is provided
         coupon_code = invoice.get("coupon_code") or data.get("coupon_code")
@@ -680,36 +912,13 @@ def submit_invoice(invoice=None, data=None):
         frappe.flags.ignore_account_permission = True
         invoice_doc.save()
 
-        # Submit invoice with error handling
-        # Note: Negative stock handling is now done through the CustomSalesInvoice override
-        # which checks POS Settings in the update_stock_ledger method
-        try:
-            invoice_doc.submit()
-        except Exception as submit_error:
-            # If submission fails, cleanup the invoice to prevent stock reservation issues
-            try:
-                # Reload to get current state
-                current_doc = frappe.get_doc("Sales Invoice", invoice_doc.name)
+        # Submit invoice
+        invoice_doc.submit()
+        invoice_submitted = True
 
-                # If already submitted, must cancel before deleting
-                if current_doc.docstatus == 1:
-                    current_doc.flags.ignore_permissions = True
-                    current_doc.cancel()
-
-                # Now delete the cancelled/draft invoice
-                frappe.delete_doc(
-                    "Sales Invoice",
-                    invoice_doc.name,
-                    force=True,
-                    ignore_permissions=True,
-                )
-                frappe.db.commit()
-            except Exception:
-                # Silent fail on cleanup - don't hide original error
-                pass
-
-            # Re-raise the original submission error
-            raise submit_error
+        # Complete the offline sync record
+        if sync_record_name:
+            _complete_offline_sync(sync_record_name, invoice_doc.name)
 
         # Handle credit redemption after successful submission
         customer_credit_dict = data.get("customer_credit_dict") or invoice.get("customer_credit_dict")
@@ -731,51 +940,32 @@ def submit_invoice(invoice=None, data=None):
                     indicator="orange"
                 )
 
-        # ============================================================================
-        # CREATE OFFLINE SYNC RECORD - Track this submission to prevent future duplicates
-        # ============================================================================
-        if offline_id:
-            try:
-                from pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync import OfflineInvoiceSync
-
-                # Create sync record with invoice metadata
-                OfflineInvoiceSync.create_sync_record(
-                    offline_id=offline_id,
-                    sales_invoice=invoice_doc.name,
-                    invoice_data={
-                        "customer": invoice_doc.customer,
-                        "grand_total": invoice_doc.grand_total,
-                        "posting_date": invoice_doc.posting_date,
-                        "posting_time": invoice_doc.posting_time
-                    }
-                )
-
-                frappe.logger().info(
-                    f"Created offline sync record: {offline_id} -> {invoice_doc.name}"
-                )
-            except Exception as sync_error:
-                # Log the error but don't fail the invoice submission
-                frappe.log_error(
-                    title="Offline Sync Record Creation Error",
-                    message=f"offline_id: {offline_id}, Invoice: {invoice_doc.name}, "
-                            f"Error: {str(sync_error)}\n{frappe.get_traceback()}"
-                )
-        # ============================================================================
-
         # Return complete invoice details
-        return {
+        result = {
             "name": invoice_doc.name,
             "status": invoice_doc.docstatus,
             "grand_total": invoice_doc.grand_total,
             "total": invoice_doc.total,
             "net_total": invoice_doc.net_total,
-            "outstanding_amount": invoice_doc.outstanding_amount,
-            "paid_amount": invoice_doc.paid_amount,
+            "outstanding_amount": getattr(invoice_doc, "outstanding_amount", 0),
+            "paid_amount": getattr(invoice_doc, "paid_amount", 0),
             "change_amount": getattr(invoice_doc, "change_amount", 0),
         }
+
+        # Include offline_id in response for client-side tracking
+        if offline_id:
+            result["offline_id"] = offline_id
+
+        return result
+
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Submit Invoice Error")
         raise
+
+    finally:
+        # Cleanup sync record if invoice was not successfully submitted
+        if sync_record_name and not invoice_submitted:
+            _cleanup_failed_sync(sync_record_name)
 
 
 # ==========================================
@@ -978,9 +1168,6 @@ def cleanup_old_drafts(pos_profile=None, max_age_hours=24):
                 "Draft Cleanup Error",
             )
 
-    if deleted_count > 0:
-        frappe.db.commit()
-
     return {
         "deleted": deleted_count,
         "message": f"Cleaned up {deleted_count} old draft invoices",
@@ -1090,8 +1277,8 @@ def search_invoices_for_return(
     doctype="Sales Invoice",
 ):
     """Search for invoices that can be returned with pagination."""
-    # Start with base filters
-    filters = {
+    # Start with base filters - use Any type for frappe filter values
+    filters: dict = {
         "docstatus": 1,
         "is_return": 0,
     }
@@ -1128,7 +1315,7 @@ def search_invoices_for_return(
         filters["grand_total"] = [">=", float(min_amount)]
 
     if max_amount:
-        if "grand_total" in filters:
+        if "grand_total" in filters and min_amount:
             filters["grand_total"] = ["between", [float(min_amount), float(max_amount)]]
         else:
             filters["grand_total"] = ["<=", float(max_amount)]
@@ -1297,7 +1484,18 @@ def apply_offers(invoice_data, selected_offers=None):
             # Either no POS profile supplied or ERPNext promotional engine unavailable
             return {"items": items}
 
-        profile = frappe.get_doc("POS Profile", invoice.get("pos_profile"))
+        profile = frappe.get_cached_doc("POS Profile", invoice.get("pos_profile"))
+
+        # Batch fetch all item details in a single query (reduces N queries to 1)
+        item_codes = list({item.get("item_code") for item in items if item.get("item_code")})
+        item_details_map = {}
+        if item_codes:
+            item_records = frappe.get_all(
+                "Item",
+                filters={"name": ["in", item_codes]},
+                fields=["name", "item_name", "item_group", "brand", "stock_uom"],
+            )
+            item_details_map = {r.name: r for r in item_records}
 
         pricing_items = []
         index_map = []
@@ -1310,15 +1508,8 @@ def apply_offers(invoice_data, selected_offers=None):
             if not item_code or qty <= 0:
                 continue
 
-            try:
-                cached = frappe.get_cached_value(
-                    "Item",
-                    item_code,
-                    ["item_name", "item_group", "brand", "stock_uom"],
-                    as_dict=1,
-                )
-            except frappe.DoesNotExistError:
-                cached = None
+            # Use batch-fetched item details
+            cached = item_details_map.get(item_code)
 
             conversion_factor = flt(item.get("conversion_factor") or 1) or 1
             price_list_rate = flt(item.get("price_list_rate") or item.get("rate") or 0)
@@ -1416,7 +1607,17 @@ def apply_offers(invoice_data, selected_offers=None):
         )
 
         # Call ERPNext pricing engine - it handles all conflicts based on priority
-        pricing_results = erpnext_apply_pricing_rule(pricing_args) or []
+        #
+        # Why we pass pricing_args twice:
+        # - 1st param (args): ERPNext extracts and pops 'items' from this, then processes each item individually
+        # - 2nd param (doc): Used by 'mixed_conditions' pricing rules to access the FULL items list
+        #                    for quantity accumulation across different items in the same group
+        #
+        # Example: A rule "Buy 2 from Demo Item Group, get 10% off" with mixed_conditions=1
+        # needs to see ALL items (1 Book + 1 Camera) to know total qty=2, not just each item's qty=1
+        #
+        # See: erpnext/accounts/doctype/pricing_rule/utils.py -> get_qty_and_rate_for_mixed_conditions()
+        pricing_results = erpnext_apply_pricing_rule(pricing_args, doc=pricing_args) or []
 
         if not pricing_results:
             return {"items": items}
@@ -1439,6 +1640,23 @@ def apply_offers(invoice_data, selected_offers=None):
                     rules = list(raw_rules)
             raw_rule_names.update(rules)
 
+        # Build a map of applicable pricing rules from the ERPNext engine results.
+        #
+        # ERPNext has two types of pricing rules:
+        #
+        # 1. Promotional Scheme Rules (promotional_scheme is set):
+        #    - Created automatically when a Promotional Scheme is saved
+        #    - The scheme acts as a "template" that generates one or more Pricing Rules
+        #    - Example: "Summer Sale" scheme creates "PRLE-0001", "PRLE-0002" rules
+        #
+        # 2. Standalone Pricing Rules (promotional_scheme is empty):
+        #    - Created directly as Pricing Rule documents
+        #    - Not linked to any Promotional Scheme
+        #    - Example: A direct "10% off Item X" rule created in Pricing Rule doctype
+        #
+        # We include BOTH types for POS, but exclude coupon_code_based rules
+        # (those require explicit coupon entry and are handled separately).
+        #
         rule_map = {}
         if raw_rule_names:
             rule_records = frappe.get_all(
@@ -1453,8 +1671,12 @@ def apply_offers(invoice_data, selected_offers=None):
                 ],
             )
             for record in rule_records:
-                if record.promotional_scheme and not record.coupon_code_based:
-                    rule_map[record.name] = record
+                # Skip coupon-based rules (require explicit coupon code entry)
+                if record.coupon_code_based:
+                    continue
+
+                # Include both promotional scheme rules and standalone pricing rules
+                rule_map[record.name] = record
 
         if selected_offer_names:
             # Restrict available rules to the ones explicitly selected from the UI.

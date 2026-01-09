@@ -1,52 +1,55 @@
 import { call } from "@/utils/apiWrapper"
-import { db, getSetting, setSetting } from "./db"
+import { logger } from "@/utils/logger"
+import { CoalescingMutex } from "@/utils/mutex"
+import { db } from "./db"
 import { offlineState } from "./offlineState"
+import { generateOfflineId } from "./uuid"
 
-// Mutex to prevent concurrent sync operations
-let syncInProgress = false
+// Re-export for backwards compatibility
+export { generateOfflineId }
+
+// Create namespaced logger for sync operations
+const log = logger.create("Sync")
+
+// Mutex for sync operations
+const syncMutex = new CoalescingMutex({ timeout: 60000, name: "InvoiceSync" })
 
 // ============================================================================
-// UUID-BASED OFFLINE ID GENERATION (Brainwise Approach)
+// CONSTANTS
 // ============================================================================
-// Generates a unique offline identifier for each invoice
-// Format: pos_offline_<uuid>
-// This ensures 100% uniqueness and allows server-side tracking
+
+const SYNC_CONFIG = {
+	MAX_RETRY_COUNT: 3,
+	CLEANUP_AGE_DAYS: 7,
+	PING_TIMEOUT_MS: 3000,
+}
+
+// Duplicate error patterns to detect already-synced invoices
+const DUPLICATE_ERROR_PATTERNS = [
+	"DUPLICATE_OFFLINE_INVOICE",
+	"already been synced",
+]
+
+// Temporary error patterns that should trigger a retry after delay
+const SYNC_IN_PROGRESS_PATTERNS = [
+	"SYNC_IN_PROGRESS",
+	"currently being processed",
+]
+
+// ============================================================================
+// SERVER CONNECTIVITY
 // ============================================================================
 
 /**
- * Generate a UUID v4
- * @returns {string} UUID string
+ * Ping server to check connectivity
+ * @returns {Promise<boolean>} Whether server is reachable
  */
-const generateUUID = () => {
-	// Use crypto.randomUUID if available (modern browsers)
-	if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-		return crypto.randomUUID()
-	}
-
-	// Fallback to manual UUID v4 generation
-	return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-		const r = (Math.random() * 16) | 0
-		const v = c === 'x' ? r : (r & 0x3) | 0x8
-		return v.toString(16)
-	})
-}
-
-/**
- * Generate offline ID for invoice
- * @returns {string} Unique offline identifier
- */
-export const generateOfflineId = () => {
-	return `pos_offline_${generateUUID()}`
-}
-
-// Ping server to check connectivity
 export const pingServer = async () => {
 	if (typeof window === "undefined") return true
 
 	try {
-		// Quick ping to check if server is reachable
 		const controller = new AbortController()
-		const timeoutId = setTimeout(() => controller.abort(), 3000) // 3 second timeout
+		const timeoutId = setTimeout(() => controller.abort(), SYNC_CONFIG.PING_TIMEOUT_MS)
 
 		const response = await fetch("/api/method/pos_next.api.ping", {
 			method: "GET",
@@ -65,278 +68,365 @@ export const pingServer = async () => {
 	}
 }
 
-// Check if offline - uses centralized state manager
+/**
+ * Check if currently offline
+ * @returns {boolean}
+ */
 export const isOffline = () => {
 	if (typeof window === "undefined") return false
 	return offlineState.isOffline
 }
 
-// NOTE: Periodic server ping is now handled by the offline worker
-// This prevents duplicate pings and centralizes the logic
+// ============================================================================
+// OFFLINE INVOICE QUEUE OPERATIONS
+// ============================================================================
 
-// Save invoice to offline queue
+/**
+ * Save invoice to offline queue with unique offline_id for deduplication
+ * @param {Object} invoiceData - Invoice data to save
+ * @returns {Promise<{success: boolean, id: number, offline_id: string}>}
+ */
 export const saveOfflineInvoice = async (invoiceData) => {
-	try {
-		// Validate invoice has items
-		if (!invoiceData.items || invoiceData.items.length === 0) {
-			throw new Error("Cannot save empty invoice")
-		}
-
-		// Clean data (remove reactive properties)
-		const cleanData = JSON.parse(JSON.stringify(invoiceData))
-
-		// ============================================================================
-		// GENERATE UNIQUE OFFLINE ID (UUID-based approach)
-		// ============================================================================
-		// Generate a unique offline_id for this invoice if not already present
-		// This ID will be sent to the server for idempotency checking
-		// ============================================================================
-		if (!cleanData.offline_id) {
-			cleanData.offline_id = generateOfflineId()
-		}
-
-		// Add to queue with offline_id
-		const invoiceId = await db.invoice_queue.add({
-			data: cleanData,
-			timestamp: Date.now(),
-			synced: false,
-			retry_count: 0,
-			offline_id: cleanData.offline_id  // Store offline_id for tracking
-		})
-
-		// Update local stock
-		await updateLocalStock(cleanData.items)
-
-		console.log(`Invoice saved to offline queue with offline_id: ${cleanData.offline_id}`)
-		return true
-	} catch (error) {
-		console.error("Error saving offline invoice:", error)
-		throw error
+	if (!invoiceData.items?.length) {
+		throw new Error("Cannot save empty invoice")
 	}
+
+	// Clean data (remove reactive properties) and add offline_id
+	const cleanData = JSON.parse(JSON.stringify(invoiceData))
+	const offlineId = generateOfflineId()
+	cleanData.offline_id = offlineId
+
+	const id = await db.invoice_queue.add({
+		offline_id: offlineId,
+		data: cleanData,
+		timestamp: Date.now(),
+		synced: false,
+		retry_count: 0,
+	})
+
+	await updateLocalStock(cleanData.items)
+
+	log.info(`Invoice saved to offline queue`, { offline_id: offlineId })
+	return { success: true, id, offline_id: offlineId }
 }
 
-// Get pending offline invoices
+/**
+ * Get all pending (unsynced) offline invoices
+ * @returns {Promise<Array>}
+ */
 export const getOfflineInvoices = async () => {
 	try {
-		// Use filter instead of where/equals for boolean values
-		const invoices = await db.invoice_queue
-			.filter((invoice) => invoice.synced === false)
-			.toArray()
-		return invoices
+		return await db.invoice_queue.filter((inv) => !inv.synced).toArray()
 	} catch (error) {
-		console.error("Error getting offline invoices:", error)
+		log.error("Failed to get offline invoices", error)
 		return []
 	}
 }
 
-// Get offline invoice count
+/**
+ * Get count of pending offline invoices
+ * @returns {Promise<number>}
+ */
 export const getOfflineInvoiceCount = async () => {
 	try {
-		// Use filter instead of where/equals for boolean values
-		const count = await db.invoice_queue
-			.filter((invoice) => invoice.synced === false)
-			.count()
-		return count
+		return await db.invoice_queue.filter((inv) => !inv.synced).count()
 	} catch (error) {
-		console.error("Error getting offline invoice count:", error)
+		log.error("Failed to get offline invoice count", error)
 		return 0
 	}
 }
 
-// Sync offline invoices to server
-export const syncOfflineInvoices = async () => {
-	// Mutex to prevent concurrent sync operations
-	if (syncInProgress) {
-		console.log("Sync already in progress, skipping duplicate sync request")
-		return { success: 0, failed: 0, skipped: true }
-	}
-
-	if (isOffline()) {
-		console.log("Cannot sync while offline")
-		return { success: 0, failed: 0 }
-	}
-
-	// Set mutex
-	syncInProgress = true
-
-	try {
-		const pendingInvoices = await getOfflineInvoices()
-		if (pendingInvoices.length === 0) {
-			return { success: 0, failed: 0 }
-		}
-
-		let successCount = 0
-		let failedCount = 0
-		let duplicateCount = 0
-		const errors = []
-
-		for (const invoice of pendingInvoices) {
-			// Defensive type check
-			if (!invoice || typeof invoice !== 'object' || !invoice.data) {
-				console.error(`Invalid invoice object at id ${invoice?.id}`)
-				failedCount++
-				continue
-			}
-
-			try {
-				// ============================================================================
-				// CLIENT-SIDE PRE-CHECK: Verify if invoice was already synced
-				// ============================================================================
-				// Before attempting to submit, check if this offline_id was already synced
-				// This reduces unnecessary server calls and network traffic
-				// ============================================================================
-				const offlineId = invoice.offline_id || invoice.data?.offline_id
-
-				if (offlineId) {
-					try {
-						// Check server if this offline_id was already synced
-						const syncCheck = await call("pos_next.pos_next.doctype.offline_invoice_sync.offline_invoice_sync.check_offline_invoice_synced", {
-							offline_id: offlineId
-						})
-
-						if (syncCheck && syncCheck.synced) {
-							console.log(`Invoice already synced: ${offlineId} -> ${syncCheck.sales_invoice}`)
-
-							// Mark as synced locally
-							await db.invoice_queue.update(invoice.id, {
-								synced: true,
-								duplicate: true,
-								synced_invoice_name: syncCheck.sales_invoice
-							})
-
-							duplicateCount++
-							continue
-						}
-					} catch (checkError) {
-						// If pre-check fails, continue with submission
-						// The server-side idempotency check will catch duplicates
-						console.warn(`Pre-check failed for ${offlineId}, continuing with submission:`, checkError)
-					}
-				}
-				// ============================================================================
-
-				// Transform items: map 'quantity' to 'qty' for ERPNext compatibility
-				// Offline storage uses 'quantity' (cart format) but server expects 'qty'
-				const invoiceData = { ...invoice.data }
-
-				// Ensure offline_id is present in invoice data
-				if (offlineId && !invoiceData.offline_id) {
-					invoiceData.offline_id = offlineId
-				}
-
-				// Defensive type check for items array
-				if (invoiceData.items && Array.isArray(invoiceData.items)) {
-					invoiceData.items = invoiceData.items.map((item) => {
-						// Defensive checks for item object
-						if (!item || typeof item !== 'object') {
-							return item
-						}
-						return {
-							...item,
-							qty: item.quantity || item.qty || 1,
-						}
-					})
-				} else {
-					console.error(`Invoice ${invoice.id} has invalid items array`)
-					throw new Error('Invalid items array')
-				}
-
-				// ============================================================================
-				// SUBMIT INVOICE TO SERVER (with server-side idempotency protection)
-				// ============================================================================
-				const response = await call("pos_next.api.invoices.submit_invoice", {
-					data: JSON.stringify({
-						invoice: invoiceData,
-						data: {},
-					}),
-				})
-
-				if (response.message || response.name) {
-					// Check if this was detected as a duplicate by the server
-					const isDuplicate = response.is_duplicate === true
-
-					if (isDuplicate) {
-						console.log(`Server detected duplicate: ${offlineId} -> ${response.name}`)
-						duplicateCount++
-					} else {
-						successCount++
-					}
-
-					// Mark as synced
-					await db.invoice_queue.update(invoice.id, {
-						synced: true,
-						synced_invoice_name: response.name || response.message,
-						duplicate: isDuplicate
-					})
-
-					console.log(
-						`Invoice ${invoice.id} ${isDuplicate ? 'was duplicate of' : 'synced successfully as'} ${response.name || response.message}`,
-					)
-				}
-			} catch (error) {
-				console.error(`Error syncing invoice ${invoice.id}:`, error)
-
-				// Store error details
-				errors.push({
-					invoiceId: invoice.id,
-					customer: invoice.data?.customer || "Walk-in Customer",
-					error: error,
-				})
-
-				// Increment retry count with defensive check
-				const currentRetryCount = typeof invoice.retry_count === 'number'
-					? invoice.retry_count
-					: 0
-
-				await db.invoice_queue.update(invoice.id, {
-					retry_count: currentRetryCount + 1,
-				})
-
-				failedCount++
-
-				// If retry count exceeds threshold, mark as failed
-				if (currentRetryCount >= 3) {
-					await db.invoice_queue.update(invoice.id, {
-						sync_failed: true,
-						error: error.message || String(error),
-					})
-				}
-			}
-		}
-
-		// Clean up synced invoices older than 7 days
-		const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
-		await db.invoice_queue
-			.filter((item) => item.synced === true && item.timestamp < weekAgo)
-			.delete()
-
-		return {
-			success: successCount,
-			failed: failedCount,
-			duplicates: duplicateCount,
-			errors
-		}
-	} finally {
-		// Always release mutex
-		syncInProgress = false
-	}
-}
-
-// Delete offline invoice
+/**
+ * Delete an offline invoice by ID
+ * @param {number} id - Invoice queue ID
+ * @returns {Promise<boolean>}
+ */
 export const deleteOfflineInvoice = async (id) => {
 	try {
 		await db.invoice_queue.delete(id)
 		return true
 	} catch (error) {
-		console.error("Error deleting offline invoice:", error)
+		log.error("Failed to delete offline invoice", { id, error })
 		return false
 	}
 }
 
-// Update local stock after invoice
+// ============================================================================
+// DEDUPLICATION CHECK
+// ============================================================================
+
+/**
+ * Check if an offline_id has already been synced to the server.
+ * @param {string} offlineId - The offline_id to check
+ * @returns {Promise<{synced: boolean, sales_invoice?: string}>}
+ */
+export const checkOfflineIdSynced = async (offlineId) => {
+	if (!offlineId) return { synced: false }
+
+	try {
+		const response = await call(
+			"pos_next.api.invoices.check_offline_invoice_synced",
+			{ offline_id: offlineId },
+		)
+		return response || { synced: false }
+	} catch (error) {
+		// If check fails, assume not synced - server will still deduplicate
+		log.warn("Failed to check sync status", { offline_id: offlineId, error })
+		return { synced: false }
+	}
+}
+
+/**
+ * Check if an error message indicates a duplicate invoice
+ * @param {Error|string} error - Error to check
+ * @returns {{isDuplicate: boolean, invoiceName: string|null}}
+ */
+const checkDuplicateError = (error) => {
+	const errorMessage = error?.message || error?.exc || error?.title || String(error)
+	const isDuplicate = DUPLICATE_ERROR_PATTERNS.some((pattern) =>
+		errorMessage.includes(pattern),
+	)
+
+	if (!isDuplicate) return { isDuplicate: false, invoiceName: null }
+
+	const match = errorMessage.match(/Sales Invoice: (\S+)/)
+	return { isDuplicate: true, invoiceName: match?.[1] || null }
+}
+
+/**
+ * Check if an error indicates another request is processing the same invoice
+ * @param {Error|string} error - Error to check
+ * @returns {boolean}
+ */
+const isSyncInProgressError = (error) => {
+	const errorMessage = error?.message || error?.exc || error?.title || String(error)
+	return SYNC_IN_PROGRESS_PATTERNS.some((pattern) =>
+		errorMessage.includes(pattern),
+	)
+}
+
+/**
+ * Wait for a specified duration
+ * @param {number} ms - Milliseconds to wait
+ * @returns {Promise<void>}
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+// ============================================================================
+// SYNC OPERATIONS
+// ============================================================================
+
+/**
+ * Mark an invoice as synced in the local database
+ * @param {number} id - Invoice queue ID
+ * @param {string} serverInvoice - Server invoice name
+ */
+const markInvoiceSynced = async (id, serverInvoice) => {
+	await db.invoice_queue.update(id, {
+		synced: true,
+		server_invoice: serverInvoice,
+	})
+}
+
+/**
+ * Increment retry count and optionally mark as failed
+ * @param {Object} invoice - Invoice record
+ * @param {string} errorMessage - Error message
+ */
+const handleSyncFailure = async (invoice, errorMessage) => {
+	const newRetryCount = (invoice.retry_count || 0) + 1
+	const updates = { retry_count: newRetryCount }
+
+	if (newRetryCount >= SYNC_CONFIG.MAX_RETRY_COUNT) {
+		updates.sync_failed = true
+		updates.error = errorMessage
+	}
+
+	await db.invoice_queue.update(invoice.id, updates)
+}
+
+/**
+ * Transform invoice data for server submission
+ * @param {Object} invoiceData - Raw invoice data
+ * @param {string} offlineId - Offline ID
+ * @returns {Object} Transformed invoice data
+ */
+const prepareInvoiceForSubmission = (invoiceData, offlineId) => {
+	const prepared = { ...invoiceData }
+
+	// Map 'quantity' to 'qty' for ERPNext compatibility
+	if (prepared.items?.length) {
+		prepared.items = prepared.items.map((item) => ({
+			...item,
+			qty: item.quantity || item.qty || 1,
+		}))
+	}
+
+	if (offlineId) {
+		prepared.offline_id = offlineId
+	}
+
+	return prepared
+}
+
+/**
+ * Sync a single invoice to the server with retry for in-progress errors
+ * @param {Object} invoice - Invoice queue record
+ * @param {number} retryCount - Current retry attempt (for in-progress waits)
+ * @returns {Promise<{status: 'success'|'skipped'|'failed', error?: Error}>}
+ */
+const syncSingleInvoice = async (invoice, retryCount = 0) => {
+	const MAX_IN_PROGRESS_RETRIES = 3
+	const IN_PROGRESS_WAIT_MS = 2000  // Wait 2 seconds between retries
+
+	const offlineId = invoice.offline_id || invoice.data?.offline_id
+
+	// Pre-sync deduplication check
+	if (offlineId) {
+		const syncStatus = await checkOfflineIdSynced(offlineId)
+		if (syncStatus.synced) {
+			await markInvoiceSynced(invoice.id, syncStatus.sales_invoice)
+			log.debug("Invoice already synced, skipping", {
+				id: invoice.id,
+				offline_id: offlineId,
+				sales_invoice: syncStatus.sales_invoice,
+			})
+			return { status: "skipped" }
+		}
+	}
+
+	// Prepare and submit
+	const invoiceData = prepareInvoiceForSubmission(invoice.data, offlineId)
+
+	try {
+		const response = await call("pos_next.api.invoices.submit_invoice", {
+			data: JSON.stringify({ invoice: invoiceData, data: {} }),
+		})
+
+		if (response.message || response.name) {
+			const serverName = response.name || response.message
+			await markInvoiceSynced(invoice.id, serverName)
+			log.success("Invoice synced", {
+				id: invoice.id,
+				offline_id: offlineId,
+				sales_invoice: serverName,
+			})
+			return { status: "success" }
+		}
+
+		throw new Error("Invalid server response")
+	} catch (error) {
+		// Handle "sync in progress" - another request is processing this invoice
+		if (isSyncInProgressError(error) && retryCount < MAX_IN_PROGRESS_RETRIES) {
+			log.debug("Invoice being processed by another request, waiting...", {
+				id: invoice.id,
+				retry: retryCount + 1,
+			})
+			await sleep(IN_PROGRESS_WAIT_MS)
+			return syncSingleInvoice(invoice, retryCount + 1)
+		}
+
+		// Re-throw other errors
+		throw error
+	}
+}
+
+/**
+ * Sync all pending offline invoices to server.
+ * Uses a mutex to ensure only one sync operation runs at a time.
+ * Concurrent callers will wait for the ongoing sync and receive its result.
+ *
+ * @returns {Promise<{success: number, failed: number, skipped: number, errors: Array}>}
+ */
+export const syncOfflineInvoices = async () => {
+	if (isOffline()) {
+		log.debug("Cannot sync while offline")
+		return { success: 0, failed: 0, skipped: 0, errors: [] }
+	}
+
+	return await syncMutex.withLock(async () => {
+		const pendingInvoices = await getOfflineInvoices()
+
+		if (!pendingInvoices.length) {
+			return { success: 0, failed: 0, skipped: 0, errors: [] }
+		}
+
+		log.info(`Starting sync of ${pendingInvoices.length} invoice(s)`)
+
+		const result = { success: 0, failed: 0, skipped: 0, errors: [] }
+
+		for (const invoice of pendingInvoices) {
+			try {
+				const syncResult = await syncSingleInvoice(invoice)
+
+				if (syncResult.status === "success") {
+					result.success++
+				} else if (syncResult.status === "skipped") {
+					result.skipped++
+				}
+			} catch (error) {
+				log.error("Failed to sync invoice", { id: invoice.id, error })
+
+				// Check for duplicate error from server
+				const { isDuplicate, invoiceName } = checkDuplicateError(error)
+				if (isDuplicate) {
+					await markInvoiceSynced(invoice.id, invoiceName)
+					log.debug("Invoice is duplicate, marked as synced", { id: invoice.id })
+					result.skipped++
+					continue
+				}
+
+				// Handle genuine failure
+				result.errors.push({
+					invoiceId: invoice.id,
+					offlineId: invoice.offline_id,
+					customer: invoice.data?.customer || "Walk-in Customer",
+					error,
+				})
+
+				await handleSyncFailure(invoice, error.message)
+				result.failed++
+			}
+		}
+
+		// Cleanup old synced invoices
+		await cleanupSyncedInvoices()
+
+		log.info("Sync completed", {
+			success: result.success,
+			skipped: result.skipped,
+			failed: result.failed,
+		})
+
+		return result
+	}, log.debug.bind(log))
+}
+
+/**
+ * Clean up synced invoices older than configured days
+ */
+const cleanupSyncedInvoices = async () => {
+	const cutoff = Date.now() - SYNC_CONFIG.CLEANUP_AGE_DAYS * 24 * 60 * 60 * 1000
+	await db.invoice_queue
+		.filter((inv) => inv.synced && inv.timestamp < cutoff)
+		.delete()
+}
+
+// ============================================================================
+// LOCAL STOCK OPERATIONS
+// ============================================================================
+
+/**
+ * Update local stock after invoice
+ * @param {Array} items - Invoice items
+ */
 export const updateLocalStock = async (items) => {
+	if (!items?.length) return
+
 	try {
 		for (const item of items) {
+			if (!item.item_code || !item.warehouse) continue
+
 			const currentStock = await db.stock.get({
 				item_code: item.item_code,
 				warehouse: item.warehouse,
@@ -353,90 +443,45 @@ export const updateLocalStock = async (items) => {
 			})
 		}
 	} catch (error) {
-		console.error("Error updating local stock:", error)
+		log.error("Failed to update local stock", error)
 	}
 }
 
-// Get local stock
+/**
+ * Get local stock for an item
+ * @param {string} itemCode - Item code
+ * @param {string} warehouse - Warehouse
+ * @returns {Promise<number>}
+ */
 export const getLocalStock = async (itemCode, warehouse) => {
 	try {
-		const stock = await db.stock.get({
-			item_code: itemCode,
-			warehouse: warehouse,
-		})
+		const stock = await db.stock.get({ item_code: itemCode, warehouse })
 		return stock?.qty || 0
 	} catch (error) {
-		console.error("Error getting local stock:", error)
+		log.error("Failed to get local stock", { item_code: itemCode, warehouse, error })
 		return 0
 	}
 }
 
-// Save offline payment
+// ============================================================================
+// OFFLINE PAYMENT OPERATIONS
+// ============================================================================
+
+/**
+ * Save payment to offline queue
+ * @param {Object} paymentData - Payment data
+ * @returns {Promise<boolean>}
+ */
 export const saveOfflinePayment = async (paymentData) => {
-	try {
-		const cleanData = JSON.parse(JSON.stringify(paymentData))
+	const cleanData = JSON.parse(JSON.stringify(paymentData))
 
-		await db.payment_queue.add({
-			data: cleanData,
-			timestamp: Date.now(),
-			synced: false,
-			retry_count: 0,
-		})
-
-		console.log("Payment saved to offline queue")
-		return true
-	} catch (error) {
-		console.error("Error saving offline payment:", error)
-		throw error
-	}
-}
-
-// Auto-sync when coming back online
-if (typeof window !== "undefined") {
-	// Listen to centralized offline state changes for auto-sync
-	offlineState.subscribe(async (state) => {
-		// Only sync when transitioning from offline to online
-		if (!state.isOffline && state.source !== 'manual') {
-			console.log("Back online, syncing pending invoices...")
-			const result = await syncOfflineInvoices()
-
-			// Dispatch event to notify components to update their pending count
-			window.dispatchEvent(
-				new CustomEvent("offlineInvoicesSynced", {
-					detail: result,
-				}),
-			)
-
-			if (result.success > 0 || result.duplicates > 0) {
-				const messages = []
-				if (result.success > 0) {
-					messages.push(`${result.success} invoice${result.success > 1 ? 's' : ''} synced`)
-				}
-				if (result.duplicates > 0) {
-					messages.push(`${result.duplicates} duplicate${result.duplicates > 1 ? 's' : ''} skipped`)
-				}
-
-				console.log(`Sync complete: ${messages.join(', ')}`)
-
-				if (window.frappe?.msgprint) {
-					window.frappe.msgprint({
-						title: __("Sync Complete"),
-						message: messages.join(', '),
-						indicator: "green",
-					})
-				}
-			}
-
-			if (result.failed > 0) {
-				console.error(`Failed to sync ${result.failed} invoices`)
-				if (window.frappe?.msgprint) {
-					window.frappe.msgprint({
-						title: __("Sync Warning"),
-						message: `${result.failed} invoice${result.failed > 1 ? 's' : ''} failed to sync. Will retry later.`,
-						indicator: "orange",
-					})
-				}
-			}
-		}
+	await db.payment_queue.add({
+		data: cleanData,
+		timestamp: Date.now(),
+		synced: false,
+		retry_count: 0,
 	})
+
+	log.info("Payment saved to offline queue")
+	return true
 }
