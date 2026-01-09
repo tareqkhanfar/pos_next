@@ -87,14 +87,29 @@ export const isOffline = () => {
  * @returns {Promise<{success: boolean, id: number, offline_id: string}>}
  */
 export const saveOfflineInvoice = async (invoiceData) => {
+	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	console.log("🔵 [OFFLINE SAVE] Starting saveOfflineInvoice")
+	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
 	if (!invoiceData.items?.length) {
+		console.error("❌ [OFFLINE SAVE] ERROR: Invoice has no items!")
 		throw new Error("Cannot save empty invoice")
 	}
+
+	console.log("📋 [OFFLINE SAVE] Invoice data received:", {
+		customer: invoiceData.customer,
+		grand_total: invoiceData.grand_total,
+		items_count: invoiceData.items?.length,
+		doctype: invoiceData.doctype,
+	})
 
 	// Clean data (remove reactive properties) and add offline_id
 	const cleanData = JSON.parse(JSON.stringify(invoiceData))
 	const offlineId = generateOfflineId()
 	cleanData.offline_id = offlineId
+
+	console.log("🆔 [OFFLINE SAVE] Generated offline_id:", offlineId)
+	console.log("💾 [OFFLINE SAVE] Adding invoice to IndexedDB...")
 
 	const id = await db.invoice_queue.add({
 		offline_id: offlineId,
@@ -104,9 +119,22 @@ export const saveOfflineInvoice = async (invoiceData) => {
 		retry_count: 0,
 	})
 
+	console.log("✅ [OFFLINE SAVE] Invoice saved to IndexedDB with ID:", id)
+
 	await updateLocalStock(cleanData.items)
 
+	console.log("📦 [OFFLINE SAVE] Local stock updated")
+
+	// Get current queue count
+	const queueCount = await db.invoice_queue.filter((inv) => !inv.synced).count()
+	console.log("📊 [OFFLINE SAVE] Current offline queue count:", queueCount)
+
 	log.info(`Invoice saved to offline queue`, { offline_id: offlineId })
+
+	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	console.log("✅ [OFFLINE SAVE] Completed successfully")
+	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
 	return { success: true, id, offline_id: offlineId }
 }
 
@@ -279,12 +307,28 @@ const syncSingleInvoice = async (invoice, retryCount = 0) => {
 	const MAX_IN_PROGRESS_RETRIES = 3
 	const IN_PROGRESS_WAIT_MS = 2000  // Wait 2 seconds between retries
 
+	console.log("┌────────────────────────────────────────────────────────────")
+	console.log("│ 🔄 [SYNC SINGLE] Syncing invoice ID:", invoice.id)
+	console.log("└────────────────────────────────────────────────────────────")
+
 	const offlineId = invoice.offline_id || invoice.data?.offline_id
+
+	console.log("🆔 [SYNC SINGLE] offline_id:", offlineId)
+	console.log("📋 [SYNC SINGLE] Invoice details:", {
+		customer: invoice.data?.customer,
+		grand_total: invoice.data?.grand_total,
+		retry_count: invoice.retry_count,
+		synced: invoice.synced,
+	})
 
 	// Pre-sync deduplication check
 	if (offlineId) {
+		console.log("🔍 [SYNC SINGLE] Checking if already synced on server...")
 		const syncStatus = await checkOfflineIdSynced(offlineId)
+		console.log("📊 [SYNC SINGLE] Server sync status:", syncStatus)
+
 		if (syncStatus.synced) {
+			console.log("⏭️  [SYNC SINGLE] Already synced, skipping. Sales Invoice:", syncStatus.sales_invoice)
 			await markInvoiceSynced(invoice.id, syncStatus.sales_invoice)
 			log.debug("Invoice already synced, skipping", {
 				id: invoice.id,
@@ -293,19 +337,31 @@ const syncSingleInvoice = async (invoice, retryCount = 0) => {
 			})
 			return { status: "skipped" }
 		}
+		console.log("✅ [SYNC SINGLE] Not yet synced, proceeding with submission")
+	} else {
+		console.warn("⚠️  [SYNC SINGLE] WARNING: No offline_id found!")
 	}
 
 	// Prepare and submit
+	console.log("🔧 [SYNC SINGLE] Preparing invoice for submission...")
 	const invoiceData = prepareInvoiceForSubmission(invoice.data, offlineId)
+	console.log("📤 [SYNC SINGLE] Submitting to server API: pos_next.api.invoices.submit_invoice")
 
 	try {
 		const response = await call("pos_next.api.invoices.submit_invoice", {
 			data: JSON.stringify({ invoice: invoiceData, data: {} }),
 		})
 
+		console.log("📥 [SYNC SINGLE] Server response received:", response)
+
 		if (response.message || response.name) {
 			const serverName = response.name || response.message
+			console.log("✅ [SYNC SINGLE] Invoice submitted successfully!")
+			console.log("📝 [SYNC SINGLE] Sales Invoice created:", serverName)
+
 			await markInvoiceSynced(invoice.id, serverName)
+			console.log("💾 [SYNC SINGLE] Marked as synced in local DB")
+
 			log.success("Invoice synced", {
 				id: invoice.id,
 				offline_id: offlineId,
@@ -314,10 +370,15 @@ const syncSingleInvoice = async (invoice, retryCount = 0) => {
 			return { status: "success" }
 		}
 
+		console.error("❌ [SYNC SINGLE] Invalid server response - no name/message field")
 		throw new Error("Invalid server response")
 	} catch (error) {
+		console.error("❌ [SYNC SINGLE] Error during sync:", error)
+		console.error("❌ [SYNC SINGLE] Error message:", error.message)
+
 		// Handle "sync in progress" - another request is processing this invoice
 		if (isSyncInProgressError(error) && retryCount < MAX_IN_PROGRESS_RETRIES) {
+			console.log("⏸️  [SYNC SINGLE] Invoice being processed elsewhere, waiting...")
 			log.debug("Invoice being processed by another request, waiting...", {
 				id: invoice.id,
 				retry: retryCount + 1,
@@ -339,17 +400,36 @@ const syncSingleInvoice = async (invoice, retryCount = 0) => {
  * @returns {Promise<{success: number, failed: number, skipped: number, errors: Array}>}
  */
 export const syncOfflineInvoices = async () => {
+	console.log("╔════════════════════════════════════════════════════════════╗")
+	console.log("║  🚀 [SYNC ALL] STARTING OFFLINE INVOICE SYNC               ║")
+	console.log("╚════════════════════════════════════════════════════════════╝")
+
 	if (isOffline()) {
+		console.warn("⚠️  [SYNC ALL] Currently offline, cannot sync")
 		log.debug("Cannot sync while offline")
 		return { success: 0, failed: 0, skipped: 0, errors: [] }
 	}
 
+	console.log("🌐 [SYNC ALL] Online - proceeding with sync")
+
 	return await syncMutex.withLock(async () => {
+		console.log("🔒 [SYNC ALL] Acquired sync mutex lock")
+
 		const pendingInvoices = await getOfflineInvoices()
 
+		console.log("📊 [SYNC ALL] Pending invoices count:", pendingInvoices.length)
+
 		if (!pendingInvoices.length) {
+			console.log("✅ [SYNC ALL] No pending invoices to sync")
 			return { success: 0, failed: 0, skipped: 0, errors: [] }
 		}
+
+		console.log("📋 [SYNC ALL] Pending invoices:", pendingInvoices.map(inv => ({
+			id: inv.id,
+			offline_id: inv.offline_id,
+			customer: inv.data?.customer,
+			grand_total: inv.data?.grand_total,
+		})))
 
 		log.info(`Starting sync of ${pendingInvoices.length} invoice(s)`)
 
@@ -361,15 +441,19 @@ export const syncOfflineInvoices = async () => {
 
 				if (syncResult.status === "success") {
 					result.success++
+					console.log(`✅ [SYNC ALL] Invoice ${invoice.id} synced successfully`)
 				} else if (syncResult.status === "skipped") {
 					result.skipped++
+					console.log(`⏭️  [SYNC ALL] Invoice ${invoice.id} skipped (already synced)`)
 				}
 			} catch (error) {
+				console.error(`❌ [SYNC ALL] Invoice ${invoice.id} failed:`, error)
 				log.error("Failed to sync invoice", { id: invoice.id, error })
 
 				// Check for duplicate error from server
 				const { isDuplicate, invoiceName } = checkDuplicateError(error)
 				if (isDuplicate) {
+					console.log(`🔄 [SYNC ALL] Invoice ${invoice.id} is duplicate:`, invoiceName)
 					await markInvoiceSynced(invoice.id, invoiceName)
 					log.debug("Invoice is duplicate, marked as synced", { id: invoice.id })
 					result.skipped++
@@ -390,7 +474,16 @@ export const syncOfflineInvoices = async () => {
 		}
 
 		// Cleanup old synced invoices
+		console.log("🧹 [SYNC ALL] Cleaning up old synced invoices...")
 		await cleanupSyncedInvoices()
+
+		console.log("╔════════════════════════════════════════════════════════════╗")
+		console.log("║  ✅ [SYNC ALL] SYNC COMPLETED                              ║")
+		console.log("╠════════════════════════════════════════════════════════════╣")
+		console.log(`║  Success: ${result.success.toString().padEnd(47)} ║`)
+		console.log(`║  Skipped: ${result.skipped.toString().padEnd(47)} ║`)
+		console.log(`║  Failed:  ${result.failed.toString().padEnd(47)} ║`)
+		console.log("╚════════════════════════════════════════════════════════════╝")
 
 		log.info("Sync completed", {
 			success: result.success,
